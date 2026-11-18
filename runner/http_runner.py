@@ -26,7 +26,10 @@ class _ReusableHTTPServer(ThreadingHTTPServer):
 
 
 class JsonRouter(BaseHTTPRequestHandler):
-    routes: list[tuple[str, str, Callable[..., Any]]] = []
+    # Each route is (method, path, handler) or, for a path parameter,
+    # (method, prefix, handler, suffix): the captured middle segment is passed
+    # to the handler as a second positional argument.
+    routes: list[tuple] = []
     static_index: str = ""
     static_dir: str = ""
 
@@ -88,10 +91,24 @@ class JsonRouter(BaseHTTPRequestHandler):
             ext = os.path.splitext(target)[1].lower()
             self._file(target, self._CONTENT_TYPES.get(ext, "application/octet-stream"))
             return
-        for method, prefix, handler in self.routes:
+        for route in self.routes:
+            method, prefix = route[0], route[1]
             if method == "GET" and path == prefix:
-                self._dispatch(handler, {})
+                self._dispatch(route[2], {})
                 return
+        # Parameterised GET routes: /api/alerts/{fingerprint}/events
+        from urllib.parse import unquote
+        for route in self.routes:
+            if len(route) != 4 or route[0] != "GET":
+                continue
+            _, prefix, handler, suffix = route
+            if not (path.startswith(prefix) and path.endswith(suffix)):
+                continue
+            middle = path[len(prefix):len(path) - len(suffix)]
+            if not middle or "/" in middle:
+                continue
+            self._dispatch(handler, unquote(middle))
+            return
         self._json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -99,7 +116,7 @@ class JsonRouter(BaseHTTPRequestHandler):
         body = self._read_json()
         if body is None:
             return
-        for method, prefix, handler in self.routes:
+        for method, prefix, handler in (r[:3] for r in self.routes):
             if method == "POST" and path == prefix:
                 self._dispatch(handler, body)
                 return
@@ -107,7 +124,7 @@ class JsonRouter(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
-        for method, prefix, handler in self.routes:
+        for method, prefix, handler in (r[:3] for r in self.routes):
             if method == "DELETE" and path == prefix:
                 self._dispatch(handler, {})
                 return
@@ -183,13 +200,17 @@ def run_alert_service(host: str, port: int) -> ThreadingHTTPServer:
         return service.ingest_event(conn, body)
 
     def h_alerts(_: Any) -> dict:
-        return {"alerts": service.list_alerts(conn), "silence": service.get_silence(conn)}
+        return service.read_console(cfg.db_path)
 
     def h_notifications(_: Any) -> dict:
-        return {"notifications": service.list_notifications(conn)}
+        return {"notifications": service.read_notifications(cfg.db_path)}
 
     def h_silence_get(_: Any) -> dict:
-        return service.get_silence(conn)
+        return service.read_silence(cfg.db_path)
+
+    def h_events_for_fp(fingerprint: str) -> dict:
+        return {"fingerprint": fingerprint,
+                "events": service.read_events(cfg.db_path, fingerprint)}
 
     def h_silence_set(body: Any) -> dict:
         if not isinstance(body, dict):
@@ -220,6 +241,7 @@ def run_alert_service(host: str, port: int) -> ThreadingHTTPServer:
             ("POST", "/api/events", h_events),
             ("GET", "/api/alerts", h_alerts),
             ("GET", "/api/notifications", h_notifications),
+            ("GET", "/api/alerts/", h_events_for_fp, "/events"),
             ("GET", "/api/silence", h_silence_get),
             ("POST", "/api/silence", h_silence_set),
             ("DELETE", "/api/silence", h_silence_clear),
@@ -237,20 +259,22 @@ def run_alert_service(host: str, port: int) -> ThreadingHTTPServer:
 # --------------------------------------------------------------------------- #
 # Notifier runner
 # --------------------------------------------------------------------------- #
-def run_notifier_service(host: str, port: int) -> ThreadingHTTPServer:
+def run_notifier_service(host: str, port: int,
+                         lose_first_n: int | None = None) -> ThreadingHTTPServer:
     cfg = NotifierConfig()
+    lose_first = cfg.lose_first_n if lose_first_n is None else lose_first_n
     init_db(cfg.db_path)
     conn = connect(cfg.db_path)
     notifier_core.init_notifier_db(conn)
 
     def h_health(_: Any) -> dict:
-        return {"ok": True, "service": "local-notifier", "lose_first_n": cfg.lose_first_n}
+        return {"ok": True, "service": "local-notifier", "lose_first_n": lose_first}
 
     def h_receive(body: Any) -> tuple[int, dict]:
-        return notifier_core.receive_notification(conn, body, cfg.lose_first_n)
+        return notifier_core.receive_notification(conn, body, lose_first)
 
     def h_list(_: Any) -> dict:
-        return {"notifications": notifier_core.list_received(conn)}
+        return {"notifications": notifier_core.read_received(cfg.db_path)}
 
     import os
     web_root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")

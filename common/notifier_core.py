@@ -5,7 +5,7 @@ import sqlite3
 import time
 from typing import Any, Optional
 
-from .db import transaction
+from .db import read_snapshot, transaction
 
 NOTIFIER_SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -138,3 +138,14 @@ def list_received(conn: sqlite3.Connection, limit: int = 500) -> list[dict]:
         (limit,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def read_received(db_path: str, limit: int = 500) -> list[dict]:
+    """Read the receiver's final states from one committed snapshot.
+
+    Same rule as the alert console: never read through the connection that a
+    delivery thread may hold a write transaction on, so an attempt that is in
+    flight (or one that ultimately rolls back) is never shown as accepted.
+    """
+    with read_snapshot(db_path) as conn:
+        return list_received(conn, limit)

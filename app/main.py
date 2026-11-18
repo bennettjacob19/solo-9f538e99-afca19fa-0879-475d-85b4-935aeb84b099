@@ -105,22 +105,25 @@ def post_event(event: EventIn) -> dict:
 
 @app.get("/api/alerts")
 def get_alerts() -> dict:
-    return {"alerts": service.list_alerts(_conn), "silence": service.get_silence(_conn)}
+    # One snapshot for everything the console renders: alerts, silence banner
+    # and outbox rows all come from the same committed point in time.
+    return service.read_console(config.db_path)
 
 
 @app.get("/api/alerts/{fingerprint}/events")
 def get_alert_events(fingerprint: str) -> dict:
-    return {"fingerprint": fingerprint, "events": service.list_events(_conn, fingerprint)}
+    return {"fingerprint": fingerprint,
+            "events": service.read_events(config.db_path, fingerprint)}
 
 
 @app.get("/api/notifications")
 def get_notifications() -> dict:
-    return {"notifications": service.list_notifications(_conn)}
+    return {"notifications": service.read_notifications(config.db_path)}
 
 
 @app.get("/api/silence")
 def get_silence_state() -> dict:
-    return service.get_silence(_conn)
+    return service.read_silence(config.db_path)
 
 
 @app.post("/api/silence")

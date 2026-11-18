@@ -16,20 +16,32 @@ function badge(status) {
   return `<span class="badge badge-${status}">${status}</span>`;
 }
 
-async function refresh() {
-  const [alertsData, notifData] = await Promise.all([
-    getJSON("/api/alerts"),
-    getJSON("/api/notifications"),
-  ]);
+let refreshSeq = 0;
 
-  const s = alertsData.silence;
+async function refresh() {
+  const seq = ++refreshSeq;
+  let data;
+  try {
+    // One request returns alerts, silence and outbox rows read from a single
+    // committed SQLite snapshot, so a refresh never splices state from
+    // different commit instants (e.g. a recovery that was rolled back).
+    data = await getJSON("/api/alerts");
+  } catch (err) {
+    // Keep whatever was last rendered rather than showing a partial picture.
+    console.warn("refresh failed, keeping previous view:", err);
+    return;
+  }
+  // A slower earlier refresh must never overwrite a newer one.
+  if (seq !== refreshSeq) return;
+
+  const s = data.silence;
   $("#silence-state").innerHTML = s.active
-    ? `<span class="silence-on">🔕 静默中，剩余 ${Math.ceil(s.remaining_seconds)} 秒</span>（截止 ${fmt(s.until_ts)}，原因：${s.reason || "未填写"}）`
+    ? `<span class="silence-on">🔕 静默中，剩余 ${Math.ceil(s.remaining_seconds)} 秒</span>（截止 ${fmt(s.until_ts)}，原因：${escapeHtml(s.reason || "未填写")}）`
     : '<span class="silence-off">🔔 通知正常</span>';
 
-  $("#alerts-table tbody").innerHTML = alertsData.alerts.map((a) => `
+  $("#alerts-table tbody").innerHTML = data.alerts.map((a) => `
     <tr>
-      <td><code>${a.fingerprint}</code></td>
+      <td><code>${escapeHtml(a.fingerprint)}</code></td>
       <td>${a.current_seq}</td>
       <td>${badge(a.status)}</td>
       <td>${a.round}</td>
@@ -39,10 +51,10 @@ async function refresh() {
       <td>${fmt(a.updated_at)}</td>
     </tr>`).join("") || '<tr><td colspan="8" class="muted">暂无告警</td></tr>';
 
-  $("#notifications-table tbody").innerHTML = notifData.notifications.map((n) => `
+  $("#notifications-table tbody").innerHTML = data.notifications.map((n) => `
     <tr>
-      <td><code>${n.notification_no}</code></td>
-      <td>${n.fingerprint}</td>
+      <td><code>${escapeHtml(n.notification_no)}</code></td>
+      <td>${escapeHtml(n.fingerprint)}</td>
       <td>${n.round}</td>
       <td>${n.kind}</td>
       <td>${badge(n.status)}</td>
@@ -69,12 +81,12 @@ $("#silence-form").addEventListener("submit", async (e) => {
     }),
   });
   if (!resp.ok) alert("设置失败: " + (await resp.text()));
-  refresh();
+  await refresh();
 });
 
 $("#clear-silence").addEventListener("click", async () => {
   await fetch("/api/silence", { method: "DELETE" });
-  refresh();
+  await refresh();
 });
 
 refresh();

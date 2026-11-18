@@ -42,7 +42,7 @@ def receive(body: NotificationIn) -> JSONResponse:
 
 @app.get("/api/notifications")
 def list_all() -> dict:
-    return {"notifications": notifier_core.list_received(_conn)}
+    return {"notifications": notifier_core.read_received(config.db_path)}
 
 
 _WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")

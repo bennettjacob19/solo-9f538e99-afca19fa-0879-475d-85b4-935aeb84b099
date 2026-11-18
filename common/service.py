@@ -5,7 +5,7 @@ import sqlite3
 import time
 from typing import Any, Callable, Optional
 
-from .db import transaction
+from .db import read_snapshot, transaction
 
 VALID_KINDS = ("firing", "recovery")
 
@@ -204,7 +204,11 @@ def set_silence(
             "reason=excluded.reason, updated_at=excluded.updated_at",
             (until_ts, reason, now),
         )
-    return get_silence(conn, now)
+        # Compute the response inside the transaction: reading after commit on
+        # this shared connection could observe another thread's uncommitted
+        # write (and would be missing if that write rolls back).
+        state = get_silence(conn, now)
+    return state
 
 
 def clear_silence(conn: sqlite3.Connection, now: Optional[float] = None) -> dict:
@@ -294,6 +298,38 @@ def list_events(conn: sqlite3.Connection, fingerprint: str, limit: int = 100) ->
         (fingerprint, limit),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def read_console(db_path: str) -> dict:
+    """Read everything one page refresh renders from a single commit snapshot.
+
+    Alerts, the silence banner and the outbox are queried on one dedicated
+    read-only connection inside one transaction, so they all reflect the same
+    committed instant: no uncommitted/rolled-back event or silence change can
+    appear, and rows from different commit times are never spliced together.
+    The read never blocks on the outbox worker's network calls, and entities
+    that never materialise (a rolled-back insert) simply never show up.
+    """
+    with read_snapshot(db_path) as conn:
+        alerts = list_alerts(conn)
+        silence = get_silence(conn)
+        notifications = list_notifications(conn)
+    return {"alerts": alerts, "silence": silence, "notifications": notifications}
+
+
+def read_notifications(db_path: str) -> list[dict]:
+    with read_snapshot(db_path) as conn:
+        return list_notifications(conn)
+
+
+def read_silence(db_path: str) -> dict:
+    with read_snapshot(db_path) as conn:
+        return get_silence(conn)
+
+
+def read_events(db_path: str, fingerprint: str) -> list[dict]:
+    with read_snapshot(db_path) as conn:
+        return list_events(conn, fingerprint)
 
 
 # --------------------------------------------------------------------------- #

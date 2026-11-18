@@ -65,15 +65,22 @@ CREATE TABLE IF NOT EXISTS silences (
 """
 
 
-def connect(db_path: str) -> sqlite3.Connection:
+def connect(db_path: str, *, for_read: bool = False) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     # WAL keeps readers working while the worker writes; foreign keys and
     # explicit transactions give us the atomicity guarantees we rely on.
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    # Selecting the journal mode is itself a write-level operation, so reader
+    # connections skip it (the database is already in WAL after init_db).
+    if not for_read:
+        conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA foreign_keys=ON")
+    if for_read:
+        # Never take a write lock and never expose a half-written row.
+        conn.execute("PRAGMA query_only=ON")
+    else:
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
     with _LOCKS_GUARD:
         _LOCKS[id(conn)] = threading.RLock()
     return conn
@@ -90,6 +97,32 @@ def init_db(db_path: str) -> None:
     try:
         conn.executescript(SCHEMA)
         conn.commit()
+    finally:
+        close(conn)
+
+
+@contextmanager
+def read_snapshot(db_path: str) -> Iterator[sqlite3.Connection]:
+    """Yield a dedicated read-only connection pinned to one commit snapshot.
+
+    Reads must never run on the writer connection: SQLite transactions are
+    per-connection, so a SELECT issued on a connection that another thread has
+    a write transaction open on would see that transaction's *uncommitted*
+    rows (and lose them again if it rolls back). A separate connection in WAL
+    mode sees only committed state, never waits for in-flight writers or
+    network I/O, and -- because it stays inside one deferred transaction --
+    every query in the block resolves against the same commit instant.
+    """
+    conn = connect(db_path, for_read=True)
+    try:
+        # Take explicit control of transaction boundaries: every SELECT in the
+        # block then runs inside the one read transaction opened below.
+        conn.isolation_level = None
+        conn.execute("BEGIN")
+        try:
+            yield conn
+        finally:
+            conn.rollback()
     finally:
         close(conn)
 
